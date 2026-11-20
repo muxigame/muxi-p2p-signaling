@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "muxi-p2p-signaling"
+version = "0.2.0"
+description = "Signaling for muxi-p2p: agent registration, endpoint lookup and punch rendezvous."
+requires-python = ">=3.10"
+license = "Apache-2.0"
+dependencies = ["fastapi>=0.110"]
+
+[tool.setuptools]
+packages = ["muxi_p2p_signaling"]
