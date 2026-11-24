@@ -9,6 +9,12 @@ TCP: on accept the server writes ``{"ip": ..., "port": ...}`` and closes.
 Replies are about the size of a request, and each source address gets a small budget per
 second, so the reflector is not useful for amplification.
 
+A UDP socket bound to 0.0.0.0 answers from whatever source address the kernel picks (the
+primary one), not from the address the request was sent to. A NAT with address-dependent
+filtering (most mobile and carrier NATs) drops such a reply, so the client hears only one of
+two reflector addresses and cannot tell its NAT is address-dependent. With ``addresses`` set,
+each one gets its own UDP socket and replies leave from the address that was asked.
+
 Run standalone: ``python -m muxi_p2p_signaling.reflector [--host 0.0.0.0] [--udp 45701,45702,45703]
 [--tcp 45711,45712]``.
 """
@@ -103,8 +109,11 @@ class Reflector:
     and skipped, so one busy port does not take the others down."""
 
     def __init__(self, host: str = "0.0.0.0", udp_ports=UDP_PORTS, tcp_ports=TCP_PORTS,
-                 rate_per_second: int = RATE_PER_SECOND):
+                 rate_per_second: int = RATE_PER_SECOND, addresses=()):
         self.host = host
+        #: public addresses to bind one UDP socket each (see the module docstring); used only
+        #: when every one of them is local, otherwise UDP falls back to ``host``.
+        self.addresses = tuple(str(a) for a in addresses if _is_ipv4(str(a)))
         self.udp_ports = tuple(udp_ports)
         self.tcp_ports = tuple(tcp_ports)
         self.limit = RateLimit(rate_per_second)
@@ -123,17 +132,41 @@ class Reflector:
         finally:
             writer.close()
 
-    async def start(self) -> "Reflector":
+    async def _bind_udp(self, host: str, port: int) -> asyncio.DatagramTransport:
         loop = asyncio.get_running_loop()
-        for port in self.udp_ports:
+        transport, _ = await loop.create_datagram_endpoint(
+            lambda: _Udp(self.limit), local_addr=(host, port))
+        return transport
+
+    async def _bind_per_address(self, port: int) -> list[asyncio.DatagramTransport] | None:
+        """One socket per address, or None (nothing left bound) when any address is not local."""
+        bound: list[asyncio.DatagramTransport] = []
+        for address in self.addresses:
             try:
-                transport, _ = await loop.create_datagram_endpoint(
-                    lambda: _Udp(self.limit), local_addr=(self.host, port))
+                bound.append(await self._bind_udp(address, port))
+            except OSError:
+                for transport in bound:
+                    transport.close()
+                return None
+        return bound
+
+    async def start(self) -> "Reflector":
+        wildcard = self.host in ("0.0.0.0", "", "::")
+        for port in self.udp_ports:
+            per_address = await self._bind_per_address(port) if wildcard and len(self.addresses) > 1 else None
+            if per_address:
+                self._udp.extend(per_address)
+                self.bound["udp"].append(port)
+                continue
+            try:
+                transport = await self._bind_udp(self.host, port)
             except OSError as error:
                 log.warning("reflector: UDP %s:%s unavailable: %s", self.host, port, error)
                 continue
             self._udp.append(transport)
             self.bound["udp"].append(transport.get_extra_info("sockname")[1])
+        if self.addresses and wildcard:
+            self.bound["udp_per_address"] = len(self._udp) > len(self.bound["udp"])
         for port in self.tcp_ports:
             try:
                 server = await asyncio.start_server(self._on_tcp, self.host, port)
@@ -154,12 +187,20 @@ class Reflector:
         self._tcp.clear()
 
 
+def _is_ipv4(text: str) -> bool:
+    try:
+        return ipaddress.ip_address(text).version == 4
+    except ValueError:
+        return False
+
+
 def _ports(text: str) -> list[int]:
     return [int(part) for part in text.split(",") if part.strip()]
 
 
 async def _main(args) -> None:
-    reflector = await Reflector(args.host, _ports(args.udp), _ports(args.tcp)).start()
+    addresses = [a for a in args.addresses.split(",") if a.strip()]
+    reflector = await Reflector(args.host, _ports(args.udp), _ports(args.tcp), addresses=addresses).start()
     log.info("reflector listening: %s", reflector.bound)
     try:
         await asyncio.Event().wait()
@@ -172,6 +213,8 @@ def main() -> None:
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--udp", default=",".join(map(str, UDP_PORTS)))
     parser.add_argument("--tcp", default=",".join(map(str, TCP_PORTS)))
+    parser.add_argument("--addresses", default="",
+                        help="comma-separated public IPv4 addresses to answer UDP from individually")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
     asyncio.run(_main(parser.parse_args()))
 

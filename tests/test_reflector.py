@@ -48,6 +48,55 @@ class ReflectorTests(unittest.TestCase):
         self.assertEqual({"nonce": "n1", "ip": "127.0.0.1", "port": udp_local}, udp)
         self.assertEqual({"ip": "127.0.0.1", "port": tcp_local}, tcp)
 
+    @staticmethod
+    def _free_udp_port() -> int:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        probe.bind(("0.0.0.0", 0))
+        port = probe.getsockname()[1]
+        probe.close()
+        return port
+
+    def test_each_address_replies_from_itself(self):
+        # A wildcard socket would answer both from the primary address; a NAT with
+        # address-dependent filtering drops the reply that comes from the wrong one.
+        port = self._free_udp_port()
+
+        async def scenario():
+            server = await reflector.Reflector("0.0.0.0", [port], [], addresses=["127.0.0.1", "127.0.0.2"]).start()
+            try:
+                loop = asyncio.get_running_loop()
+                sources = []
+                for address in ("127.0.0.1", "127.0.0.2"):
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    sock.bind(("127.0.0.1", 0))
+                    sock.setblocking(False)
+                    await loop.sock_sendto(sock, reflector.MAGIC + b"n", (address, port))
+                    _data, source = await asyncio.wait_for(loop.sock_recvfrom(sock, 512), 3)
+                    sources.append(source[0])
+                    sock.close()
+                return server.bound, sources
+            finally:
+                await server.stop()
+
+        bound, sources = asyncio.run(scenario())
+        self.assertEqual([port], bound["udp"])
+        self.assertTrue(bound["udp_per_address"])
+        self.assertEqual(["127.0.0.1", "127.0.0.2"], sources)
+
+    def test_non_local_address_falls_back_to_wildcard(self):
+        port = self._free_udp_port()
+
+        async def scenario():
+            server = await reflector.Reflector("0.0.0.0", [port], [], addresses=["127.0.0.1", "192.0.2.1"]).start()
+            try:
+                return server.bound
+            finally:
+                await server.stop()
+
+        bound = asyncio.run(scenario())
+        self.assertEqual([port], bound["udp"])
+        self.assertFalse(bound["udp_per_address"])
+
 
 if __name__ == "__main__":
     unittest.main()
