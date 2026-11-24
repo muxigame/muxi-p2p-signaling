@@ -44,6 +44,7 @@ def configure(
     diagnostics: bool = True,
     relay_host: str | None = None,
     relay_port: int | None = None,
+    punch_quota: int | None = None,
 ) -> None:
     """嵌入时调用一次。
 
@@ -56,8 +57,12 @@ def configure(
     嵌进网关做远程桌面时必须只给已登录的人。
 
     diagnostics=False 关掉不鉴权的 /diag 上传和读取。
+
+    punch_quota：同一出口 IP 每 PUNCH_QUOTA_WINDOW 秒能发起的打洞次数。默认的 4 次是给
+    公开领取凭据的场景（MC）的；嵌入方已经用 access_guard 认过调用方是谁，同一个办公室
+    NAT 后面又常有好几台设备，可以放宽。
     """
-    global _secret_provider, _access_guard, _diagnostics, RELAY_FALLBACK_HOST, RELAY_FALLBACK_PORT
+    global _secret_provider, _access_guard, _diagnostics, RELAY_FALLBACK_HOST, RELAY_FALLBACK_PORT, PUNCH_QUOTA
     _secret_provider = secret_provider
     _access_guard = access_guard
     _diagnostics = diagnostics
@@ -65,6 +70,8 @@ def configure(
         RELAY_FALLBACK_HOST = relay_host
     if relay_port is not None:
         RELAY_FALLBACK_PORT = relay_port
+    if punch_quota is not None:
+        PUNCH_QUOTA = max(1, int(punch_quota))
 
 
 async def _guard(request: Request, server_id: str) -> None:
