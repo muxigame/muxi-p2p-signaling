@@ -15,6 +15,20 @@ filtering (most mobile and carrier NATs) drops such a reply, so the client hears
 two reflector addresses and cannot tell its NAT is address-dependent. With ``addresses`` set,
 each one gets its own UDP socket and replies leave from the address that was asked.
 
+MUXI-REFLECT/2 (filtering test): request ``MUXI-REFLECT/2 <nonce> <same|port|ip>``. The reply has
+the v1 fields plus ``via`` (the reflector address it leaves from) and is sent from the asked
+socket (``same``), from another port on the same address (``port``) or from another address on
+the same port (``ip``). A client that sent only to the asked address learns its NAT's filtering:
+an ``ip`` reply getting through means endpoint-independent filtering, ``port`` means
+address-dependent, only ``same`` means address-and-port-dependent. When the change is not
+possible here the reply comes from the asked socket with ``"unsupported": <mode>``.
+
+Observations (live port tracking for symmetric-to-symmetric punching): a v1 request whose nonce
+is ``o.<session 16 hex>.<side c|a>.<seq>`` is answered as usual and also remembered for a short
+while. ``MUXI-OBS/1 <session> <side> <after>`` returns ``{"obs": [[seq, ip, port, age_ms], ...]}``
+for that side with seq > after, so each side can follow the other's NAT port counters while
+they punch. Entries live ``OBS_TTL`` seconds and the store is bounded.
+
 Run standalone: ``python -m muxi_p2p_signaling.reflector [--host 0.0.0.0] [--udp 45701,45702,45703]
 [--tcp 45711,45712]``.
 """
@@ -26,13 +40,21 @@ import ipaddress
 import json
 import logging
 import time
+from collections import OrderedDict
 
 MAGIC = b"MUXI-REFLECT/1 "
+MAGIC2 = b"MUXI-REFLECT/2 "
+OBS_MAGIC = b"MUXI-OBS/1 "
+MODES = ("same", "port", "ip")
+OBS_TTL = 120.0
+OBS_MAX_SESSIONS = 4096
+OBS_MAX_PER_SIDE = 256
+OBS_REPLY_MAX = 48
 UDP_PORTS = (45701, 45702, 45703)
 TCP_PORTS = (45711, 45712)
 MAX_NONCE = 64
 #: replies per source IP per second, over all ports
-RATE_PER_SECOND = 40
+RATE_PER_SECOND = 120
 
 log = logging.getLogger("muxi_p2p.reflector")
 
@@ -48,20 +70,116 @@ def _plain(host: str) -> str:
     return str(address)
 
 
+def _nonce(raw: bytes) -> str | None:
+    if not raw or len(raw) > MAX_NONCE:
+        return None
+    try:
+        text = raw.decode("ascii")
+    except UnicodeDecodeError:
+        return None
+    return text if text.isprintable() and " " not in text else None
+
+
 def udp_reply(data: bytes, host: str, port: int) -> bytes | None:
     if not data.startswith(MAGIC):
         return None
-    nonce = data[len(MAGIC):].strip()
-    if not nonce or len(nonce) > MAX_NONCE:
-        return None
-    try:
-        text = nonce.decode("ascii")
-    except UnicodeDecodeError:
-        return None
-    if not text.isprintable():
+    text = _nonce(data[len(MAGIC):].strip())
+    if text is None:
         return None
     return json.dumps({"nonce": text, "ip": _plain(host), "port": port},
                       separators=(",", ":")).encode("ascii")
+
+
+def parse_v2(data: bytes) -> tuple[str, str] | None:
+    """``MUXI-REFLECT/2 <nonce> <mode>`` -> (nonce, mode)."""
+    if not data.startswith(MAGIC2):
+        return None
+    parts = data[len(MAGIC2):].split()
+    if not parts or len(parts) > 2:
+        return None
+    nonce = _nonce(parts[0])
+    mode = parts[1].decode("ascii", "replace") if len(parts) == 2 else "same"
+    if nonce is None or mode not in MODES:
+        return None
+    return nonce, mode
+
+
+def _session_id(text: str) -> bool:
+    return len(text) == 16 and all(c in "0123456789abcdef" for c in text)
+
+
+def parse_observation(nonce: str) -> tuple[str, str, int] | None:
+    """``o.<session>.<side>.<seq>`` -> (session, side, seq)."""
+    parts = nonce.split(".")
+    if len(parts) != 4 or parts[0] != "o":
+        return None
+    session, side, seq = parts[1].lower(), parts[2], parts[3]
+    if not _session_id(session) or side not in ("c", "a") or not seq.isdigit() or len(seq) > 6:
+        return None
+    return session, side, int(seq)
+
+
+def parse_obs_query(data: bytes) -> tuple[str, str, int] | None:
+    """``MUXI-OBS/1 <session> <side> <after>`` -> (session, side, after)."""
+    if not data.startswith(OBS_MAGIC):
+        return None
+    try:
+        parts = data[len(OBS_MAGIC):].decode("ascii").split()
+    except UnicodeDecodeError:
+        return None
+    if len(parts) != 3:
+        return None
+    session, side, after = parts[0].lower(), parts[1], parts[2]
+    if not _session_id(session) or side not in ("c", "a"):
+        return None
+    try:
+        number = int(after)
+    except ValueError:
+        return None
+    return session, side, max(-1, min(number, 999999))
+
+
+class Observations:
+    """Ports the reflector saw for each (session, side), newest last; bounded and short-lived."""
+
+    def __init__(self, ttl: float = OBS_TTL, max_sessions: int = OBS_MAX_SESSIONS,
+                 max_per_side: int = OBS_MAX_PER_SIDE):
+        self.ttl = ttl
+        self.max_sessions = max_sessions
+        self.max_per_side = max_per_side
+        #: session -> (created, {side: [(seq, ip, port, at)]})
+        self._sessions: OrderedDict[str, tuple[float, dict[str, list[tuple[int, str, int, float]]]]] = OrderedDict()
+
+    def _purge(self, now: float) -> None:
+        while self._sessions:
+            session, (created, _) = next(iter(self._sessions.items()))
+            if now - created <= self.ttl and len(self._sessions) <= self.max_sessions:
+                break
+            del self._sessions[session]
+
+    def record(self, session: str, side: str, seq: int, ip: str, port: int, now: float | None = None) -> None:
+        now = time.monotonic() if now is None else now
+        self._purge(now)
+        entry = self._sessions.get(session)
+        if entry is None:
+            entry = (now, {})
+            self._sessions[session] = entry
+            self._purge(now)
+        sides = entry[1]
+        seen = sides.setdefault(side, [])
+        if len(seen) >= self.max_per_side or any(item[0] == seq for item in seen):
+            return
+        seen.append((seq, ip, port, now))
+
+    def since(self, session: str, side: str, after: int, now: float | None = None) -> list[list]:
+        now = time.monotonic() if now is None else now
+        self._purge(now)
+        entry = self._sessions.get(session)
+        if entry is None:
+            return []
+        items = [item for item in entry[1].get(side, []) if item[0] > after]
+        items.sort(key=lambda item: item[0])
+        return [[seq, ip, port, int((now - at) * 1000)] for seq, ip, port, at in items[:OBS_REPLY_MAX]]
 
 
 def tcp_reply(host: str, port: int) -> bytes:
@@ -87,8 +205,9 @@ class RateLimit:
 
 
 class _Udp(asyncio.DatagramProtocol):
-    def __init__(self, limit: RateLimit):
-        self.limit = limit
+    def __init__(self, owner: "Reflector"):
+        self.owner = owner
+        self.limit = owner.limit
         self.transport: asyncio.DatagramTransport | None = None
 
     def connection_made(self, transport):
@@ -96,9 +215,38 @@ class _Udp(asyncio.DatagramProtocol):
 
     def datagram_received(self, data, addr):
         host, port = addr[0], addr[1]
+        if self.transport is None:
+            return
+        if data.startswith(MAGIC2):
+            parsed = parse_v2(data)
+            if parsed is None or not self.limit.allow(host):
+                return
+            nonce, mode = parsed
+            via, unsupported = self.owner.sibling(self.transport, mode)
+            local = via.get_extra_info("sockname") or ("?", 0)
+            body = {"nonce": nonce, "ip": _plain(host), "port": port,
+                    "via": f"{_plain(local[0])}:{local[1]}"}
+            if unsupported:
+                body["unsupported"] = mode
+            via.sendto(json.dumps(body, separators=(",", ":")).encode("ascii"), addr)
+            return
+        if data.startswith(OBS_MAGIC):
+            query = parse_obs_query(data)
+            if query is None or not self.limit.allow(host):
+                return
+            session, side, after = query
+            body = {"session": session, "side": side,
+                    "obs": self.owner.observations.since(session, side, after)}
+            self.transport.sendto(json.dumps(body, separators=(",", ":")).encode("ascii"), addr)
+            return
         reply = udp_reply(data, host, port)
-        if reply is not None and self.transport is not None and self.limit.allow(host):
-            self.transport.sendto(reply, addr)
+        if reply is None or not self.limit.allow(host):
+            return
+        observation = parse_observation(data[len(MAGIC):].strip().decode("ascii", "replace"))
+        if observation is not None:
+            session, side, seq = observation
+            self.owner.observations.record(session, side, seq, _plain(host), port)
+        self.transport.sendto(reply, addr)
 
     def error_received(self, exc):  # ICMP errors from earlier sends; nothing to do
         pass
@@ -117,6 +265,7 @@ class Reflector:
         self.udp_ports = tuple(udp_ports)
         self.tcp_ports = tuple(tcp_ports)
         self.limit = RateLimit(rate_per_second)
+        self.observations = Observations()
         self._udp: list[asyncio.DatagramTransport] = []
         self._tcp: list[asyncio.base_events.Server] = []
         self.bound: dict[str, list[int]] = {"udp": [], "tcp": []}
@@ -135,8 +284,22 @@ class Reflector:
     async def _bind_udp(self, host: str, port: int) -> asyncio.DatagramTransport:
         loop = asyncio.get_running_loop()
         transport, _ = await loop.create_datagram_endpoint(
-            lambda: _Udp(self.limit), local_addr=(host, port))
+            lambda: _Udp(self), local_addr=(host, port))
         return transport
+
+    def sibling(self, asked: asyncio.DatagramTransport, mode: str) -> tuple[asyncio.DatagramTransport, bool]:
+        """The socket a v2 reply leaves from, and whether the asked change was impossible."""
+        if mode == "same":
+            return asked, False
+        here = asked.get_extra_info("sockname") or ("", 0)
+        for other in self._udp:
+            there = other.get_extra_info("sockname") or ("", 0)
+            if mode == "port" and there[0] == here[0] and there[1] != here[1]:
+                return other, False
+            if (mode == "ip" and there[1] == here[1] and there[0] != here[0]
+                    and there[0] not in ("0.0.0.0", "::")):
+                return other, False
+        return asked, True
 
     async def _bind_per_address(self, port: int) -> list[asyncio.DatagramTransport] | None:
         """One socket per address, or None (nothing left bound) when any address is not local."""
